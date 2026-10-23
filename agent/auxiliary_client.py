@@ -1028,13 +1028,23 @@ def _load_pool_with_credentials(provider: str, note: str = "") -> Optional[Any]:
     return pool if pool and pool.has_credentials() else None
 
 
-def _select_pool_entry(provider: str) -> Tuple[bool, Optional[Any]]:
-    """Return (pool_exists_for_provider, selected_entry)."""
+def _select_pool_entry(provider: str, *, model: Optional[str] = None) -> Tuple[bool, Optional[Any]]:
+    """Return (pool_exists_for_provider, selected_entry).
+
+    *model* scopes selection to that model's cooldowns. ``model_cooldowns`` is per-model
+    (``agent/credential_pool_model_cooldowns.py``: a Codex ChatGPT-plan entitlement 400 benches
+    one (credential, model) pair for a year), so a MODEL-LESS select is refused as soon as ANY
+    model on the entry is benched. A caller that already knows the model it is resolving MUST
+    pass it — otherwise one unused model's bench silently disables the whole provider for that
+    call path, which is how auxiliary Codex resolution died while the main lane kept working.
+
+    A caller without a model keeps the pool's model-less select unchanged.
+    """
     pool = _load_pool_with_credentials(provider)
     if pool is None:
         return False, None
     try:
-        return True, pool.select()
+        return True, pool.select(model=model) if model else pool.select()
     except Exception as exc:
         logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
         return True, None
@@ -2927,7 +2937,7 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
             "pass model explicitly (auxiliary.<task>.model in config.yaml)."
         )
         return None, None
-    pool_present, entry = _select_pool_entry("openai-codex")
+    pool_present, entry = _select_pool_entry("openai-codex", model=model)
     codex_token = _pool_runtime_api_key(entry) if pool_present else None
     codex_override = _codex_base_url_override()
     if codex_token:
