@@ -70,6 +70,7 @@ import { chooseSendFormat } from "./send-format.mjs";
 import {
   classifyProbeRejection,
   createProbeMessageId,
+  isStreamReady,
   shouldProbe,
   isZombieSuspect,
 } from "./stream-staleness.mjs";
@@ -159,6 +160,10 @@ function streamHealthSnapshot() {
     streamHealth.degradedSince === null ? 0 : now - streamHealth.degradedSince;
   return {
     ok: streamHealth.state !== "degraded",
+    // Explicit readiness (true only for `healthy`): the Python adapter and
+    // out-of-process senders get one unambiguous boolean without changing the
+    // existing `ok`/`state` fields they already consume.
+    ready: isStreamReady(streamHealth.state),
     state: streamHealth.state,
     degradedForMs,
     restartAfterMs: STREAM_DEGRADED_RESTART_MS,
@@ -359,6 +364,19 @@ const knownMessages = new Map();
 // /unreact can `unsend()` it later.
 const reactionHandles = new Map();
 
+// Last transport service observed per peer space ({"iMessage"|"SMS"|"RCS"}),
+// so diagnostics can say which transport a conversation is actually on.
+const spaceServiceCache = new Map();
+// Per-space typing breaker. A recipient whose iMessage registration is gone
+// (Apple's sendErrorCode 22 on a Photon shared line) makes EVERY /typing call
+// raise `ValidationError: Typing requires iMessage, but that service is not
+// currently available for this recipient.` — without a breaker that becomes a
+// stack trace on every keep-typing tick, and the adapter's four stop_typing
+// calls per turn multiply it. Set on the first rejection, cleared by the next
+// inbound message that proves iMessage works again.
+const typingUnavailableUntil = new Map();
+const TYPING_UNAVAILABLE_TTL_MS = 10 * 60 * 1000;
+
 function lruSet(map, key, value, cap) {
   if (map.has(key)) map.delete(key);
   map.set(key, value);
@@ -366,6 +384,27 @@ function lruSet(map, key, value, cap) {
     const oldest = map.keys().next().value;
     if (oldest !== undefined) map.delete(oldest);
   }
+}
+
+// One key per *peer*, not per address form: the Python adapter may address a DM
+// by chat GUID (`any;-;+1...`) while inbound events carry the same phone or the
+// opaque GUID. Collapsing them keeps a breaker set on one form effective for
+// the other (mirrors phoneTargetFromSpaceId).
+function spaceServiceKey(spaceId) {
+  return phoneTargetFromSpaceId(spaceId) || (typeof spaceId === "string" ? spaceId : "");
+}
+
+// The SDK rejects a typing call for a recipient whose iMessage registration is
+// gone (Apple reports sendErrorCode 22 on this Photon line). Match the observed
+// upstream text first, then the SDK error class — but never swallow an
+// unrelated ValidationError, which would hide a real bug as a silent skip.
+const TYPING_UNAVAILABLE_RE =
+  /typing requires imessage|typing[^.]*service is not currently available/i;
+
+function isTypingUnavailableError(err) {
+  const message = String((err && err.message) || err);
+  if (TYPING_UNAVAILABLE_RE.test(message)) return true;
+  return err?.name === "ValidationError" && /typing/i.test(message);
 }
 
 function rememberKnownSpace(id, space) {
@@ -606,16 +645,27 @@ const readReceiptsEnabled =
   (process.env.PHOTON_READ_RECEIPTS || "true").trim().toLowerCase() !==
   "false";
 
-async function acknowledgeInboundRead(message) {
+async function acknowledgeInboundRead(message, senderService) {
   if (!readReceiptsEnabled) return;
   if (message?.content?.type === "read") return;
   if (typeof message?.read !== "function") return;
+  if (senderService === "RCS" || senderService === "SMS") {
+    // Apple only pushes read receipts over iMessage; on a non-iMessage thread
+    // read() rejects with "requires iMessage". Receipts are presence polish, not
+    // a delivery dependency, so skip quietly rather than warn per message.
+    return;
+  }
   try {
     await message.read();
   } catch (error) {
-    // Read receipts are presence polish, not a delivery dependency.
-    console.warn(
-      "photon-sidecar: failed to mark inbound message read: " +
+    // One structured line — no stack trace — so errors.log still records that a
+    // real receipt failure happened, with the transport it happened on.
+    console.error(
+      "photon-sidecar: read-receipt failed space=" +
+        (message?.space?.id || "unknown") +
+        " service=" +
+        (senderService || "unknown") +
+        " err=" +
         (error?.message || String(error))
     );
   }
@@ -625,6 +675,13 @@ async function normalizeEvent(space, message) {
   try {
     const msgSpace = message.space || {};
     const ts = message.timestamp;
+    // Transport the message actually arrived on. Photon re-sends over RCS (or
+    // SMS) when Apple's iMessage registration for this line is gone, and the
+    // gateway needs to see which one it was instead of a bare sender id.
+    const senderService =
+      message?.sender && typeof message.sender.service === "string"
+        ? message.sender.service
+        : null;
     return {
       messageId: message.id ?? null,
       platform: message.platform || space.__platform || "iMessage",
@@ -634,7 +691,14 @@ async function normalizeEvent(space, message) {
         type: space.type ?? msgSpace.type ?? "dm",
         phone: space.phone ?? msgSpace.phone ?? null,
       },
-      sender: { id: message.sender ? message.sender.id : null },
+      sender: {
+        id: message.sender ? message.sender.id : null,
+        ...(senderService ? { service: senderService } : {}),
+      },
+      // Explicit transport for consumers that only look at the top level; the
+      // SDK's own default is iMessage (the only provider this sidecar builds).
+      // The raw declared value stays on `sender.service` for the breaker logic.
+      service: senderService || "iMessage",
       content: await normalizeContent(message.content),
       timestamp:
         ts instanceof Date ? ts.toISOString() : ts ? String(ts) : null,
@@ -693,8 +757,26 @@ function inboundStreamErrorMessage(e) {
         rememberKnownMessage(message);
         const event = await normalizeEvent(space, message);
         if (!event) continue;
+        const serviceKey = spaceServiceKey(event.space ? event.space.id : null);
+        const declaredService =
+          event.sender && typeof event.sender.service === "string"
+            ? event.sender.service
+            : null;
+        if (declaredService) {
+          lruSet(
+            spaceServiceCache,
+            serviceKey,
+            { service: declaredService, updatedAt: Date.now() },
+            MAX_KNOWN_SPACES
+          );
+          if (declaredService === "iMessage") {
+            // Inbound iMessage proves the recipient's transport works, so lift
+            // the typing breaker now instead of waiting out its TTL.
+            typingUnavailableUntil.delete(serviceKey);
+          }
+        }
         await deliver(JSON.stringify(event));
-        await acknowledgeInboundRead(message);
+        await acknowledgeInboundRead(message, declaredService);
       }
       console.error("photon-sidecar: inbound stream ended — re-subscribing");
       markStreamRecovering("inbound stream ended");
@@ -1022,8 +1104,10 @@ const server = http.createServer(async (req, res) => {
     if (req.url === "/probe") {
       // Upstream liveness probe. Drives a cheap unary read over the SAME gRPC
       // channel the inbound stream uses. STRICT semantics: only a completed
-      // round-trip (resolution, or a not-found rejection for our synthetic
-      // id) counts as alive; any other rejection or a timeout is
+      // round-trip counts as alive — resolution, or a SERVER-ANSWERED
+      // rejection for our synthetic id (not-found, INVALID_ARGUMENT, or any
+      // `[spectrum-*]`-stamped SDK error: the server answered, so the wire
+      // round-tripped). Transport failures and FAILED_PRECONDITION are
       // INCONCLUSIVE — never reported as alive.
       const outcome = await probeUpstream();
       if (outcome.alive) {
@@ -1068,7 +1152,18 @@ const server = http.createServer(async (req, res) => {
           ? spectrumMarkdown(text)
           : spectrumText(text);
       const result = await space.send(builder);
-      return ok(res, { messageId: result?.id || null });
+      const sendErrorCode = result?.sendErrorCode ?? 0;
+      if (sendErrorCode && sendErrorCode !== 0) {
+        // The SDK resolved but Apple's send failed (22 = recipient not reachable
+        // over iMessage). Photon then re-sends over RCS; one structured line
+        // makes that transport downgrade visible without a stack trace.
+        console.error(
+          "photon-sidecar: outbound send reported sendErrorCode=" +
+            sendErrorCode +
+            " (Apple could not deliver over iMessage; upstream may fall back to RCS)"
+        );
+      }
+      return ok(res, { messageId: result?.id || null, sendErrorCode });
     }
     if (req.url === "/send-richlink") {
       const { spaceId, url } = body || {};
@@ -1209,8 +1304,34 @@ const server = http.createServer(async (req, res) => {
       if (state !== "start" && state !== "stop") {
         return badRequest(res, "state must be start or stop");
       }
+      const spaceKey = spaceServiceKey(spaceId);
+      if ((typingUnavailableUntil.get(spaceKey) || 0) > Date.now()) {
+        // Known non-iMessage recipient: Apple rejects every typing call for this
+        // space, so skip the gRPC round-trip entirely. HTTP 200 keeps the
+        // adapter's soft-failing call a silent no-op, and nothing is logged per
+        // tick — the transition was reported once when the breaker tripped.
+        return ok(res, { skipped: true, reason: "imessage_unavailable" });
+      }
       const space = await resolveSpace(spaceId);
-      await space.send(spectrumTyping(state));
+      try {
+        await space.send(spectrumTyping(state));
+      } catch (err) {
+        if (isTypingUnavailableError(err)) {
+          lruSet(
+            typingUnavailableUntil,
+            spaceKey,
+            Date.now() + TYPING_UNAVAILABLE_TTL_MS,
+            MAX_KNOWN_SPACES
+          );
+          console.error(
+            "photon-sidecar: typing unavailable for " +
+              spaceKey +
+              " (recipient transport is non-iMessage/RCS); suppressing typing for 10m"
+          );
+          return ok(res, { skipped: true, reason: "imessage_unavailable" });
+        }
+        throw err;
+      }
       return ok(res, {});
     }
     res.statusCode = 404;

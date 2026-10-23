@@ -21,7 +21,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:  # type checkers see httpx as always-imported; runtime keeps it optional
@@ -537,6 +537,12 @@ class PhotonAdapter(BasePlatformAdapter):
         self._last_inbound_by_chat: Dict[str, str] = {}  # default target for the react action
         self._recent_richlinks_by_chat: Dict[str, float] = {}  # coalesce preview-art attachments
         self._typing_last_sent: Dict[str, float] = {}
+        # Chats with a live typing indicator on the wire. base.py's turn teardown
+        # calls stop_typing up to four times (keep-typing finally + two refresh
+        # passes + the outer finally); without this set every one of them became a
+        # separate stopTyping RPC, and each rejected one logged a stack trace.
+        self._typing_active: Set[str] = set()
+        self._last_service_by_chat: Dict[str, str] = {}  # last transport service seen per chat
         self._pending_fffc: Dict[str, tuple[float, Any]] = {}  # chat_key → (timestamp, asyncio.Task)
         # Group-chat mention gating (parity with BlueBubbles); DMs are never gated.
         require_mention = extra.get("require_mention")
@@ -762,6 +768,18 @@ class PhotonAdapter(BasePlatformAdapter):
         timestamp = _parse_timestamp(event.get("timestamp") or "")
         message_id = event.get("messageId")
         ctype = content.get("type")
+
+        # Transport the message arrived on. Photon falls back to RCS/SMS when
+        # Apple's iMessage registration for the shared line is gone; logging the
+        # transition (once per change) is how an operator sees the downgrade
+        # instead of inferring it from send failures.
+        sender_service = sender.get("service") or event.get("service")
+        if sender_service:
+            service_key = self._normalize_chat_key(space_id)
+            if self._last_service_by_chat.get(service_key) != sender_service:
+                bounded_put(self._last_service_by_chat, service_key, sender_service,
+                            self._LAST_INBOUND_CHATS_MAX)
+                logger.info("[photon] chat %s inbound transport service=%s", space_id, sender_service)
 
         def _event(text: str, mtype: MessageType = MessageType.TEXT, **kwargs: Any) -> MessageEvent:
             source = self.build_source(chat_id=space_id, chat_name=space_id, chat_type=chat_type,
@@ -1195,24 +1213,42 @@ class PhotonAdapter(BasePlatformAdapter):
 
     # send_animation: base falls back to send_image (iMessage renders GIFs inline as images).
 
-    async def _sidecar_try(self, path: str, body: Dict[str, Any], what: str) -> bool:
-        """Soft-failing sidecar call: True on success, False (debug-logged) on any error."""
+    async def _sidecar_json(self, path: str, body: Dict[str, Any], what: str) -> Optional[Dict[str, Any]]:
+        """Soft-failing sidecar call: the decoded payload, or None (debug-logged) on any error.
+
+        Callers that only need success/failure use ``_sidecar_try``; callers that must
+        inspect the payload (e.g. ``{"skipped": true}`` from the typing breaker) need it."""
         try:
-            await self._sidecar_call(path, body)
-            return True
+            return await self._sidecar_call(path, body)
         except Exception as e:
             logger.debug("[photon] %s failed: %s", what, e)
-            return False
+            return None
+
+    async def _sidecar_try(self, path: str, body: Dict[str, Any], what: str) -> bool:
+        """Soft-failing sidecar call: True on success, False (debug-logged) on any error."""
+        return await self._sidecar_json(path, body, what) is not None
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         now = time.time()
         if now - self._typing_last_sent.get(chat_id, 0.0) < _TYPING_COOLDOWN_SECONDS:
             return
         self._typing_last_sent[chat_id] = now
-        await self._sidecar_try("/typing", {"spaceId": chat_id, "state": "start"}, "send_typing")
+        payload = await self._sidecar_json("/typing", {"spaceId": chat_id, "state": "start"}, "send_typing")
+        # A skipped call (recipient transport is not iMessage) put nothing on the
+        # wire, so a later stop_typing must not call /typing either.
+        if payload is not None and not payload.get("skipped"):
+            self._typing_active.add(self._normalize_chat_key(chat_id))
 
     async def stop_typing(self, chat_id: str) -> None:
         self._typing_last_sent.pop(chat_id, None)
+        key = self._normalize_chat_key(chat_id)
+        self._typing_last_sent.pop(key, None)
+        # At most ONE stopTyping RPC per live indicator. base.py's turn teardown
+        # calls stop_typing up to four times; the extra calls are no-ops here
+        # (and no-ops on the wire when typing was never started).
+        if key not in self._typing_active:
+            return
+        self._typing_active.discard(key)
         await self._sidecar_try("/typing", {"spaceId": chat_id, "state": "stop"}, "stop_typing")
 
     # -- Reactions (tapbacks). Lifecycle hooks (👀 while processing, 👍/👎 on completion)
